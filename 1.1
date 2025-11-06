@@ -1,0 +1,397 @@
+"""
+main.py
+
+Advanced AI Chatbot (Production-ready)
+-------------------------------------
+- FastAPI app serving:
+  - GET  /           -> interactive web UI (dark theme, markdown)
+  - POST /chat       -> non-streaming API
+  - WS   /stream/ws  -> streaming API (WebSocket)
+  - POST /upload-docs-> upload text docs for RAG (optional)
+
+Notes:
+- Put your OpenAI key in a .env file: OPENAI_API_KEY=sk-...
+- Install dependencies: pip install -r requirements.txt
+  Suggested requirements.txt:
+    fastapi
+    uvicorn[standard]
+    python-dotenv
+    openai
+    pydantic
+    # optional:
+    sentence-transformers
+    faiss-cpu
+"""
+
+import os
+import json
+from typing import List, Dict, Optional, AsyncGenerator
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+# Optional RAG dependencies (keep optional so app imports even if not installed)
+try:
+    from sentence_transformers import SentenceTransformer
+    import faiss
+except Exception:
+    SentenceTransformer = None
+    faiss = None
+
+# OpenAI client (optional)
+try:
+    import openai
+except Exception:
+    openai = None
+
+# Load env
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+if openai and OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+
+# App
+app = FastAPI(title="Advanced AI Chatbot")
+
+# -------------------------
+# Models
+# -------------------------
+class Message(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[Message]
+    stream: Optional[bool] = False
+    max_tokens: Optional[int] = 1024
+    temperature: Optional[float] = 0.3
+
+# -------------------------
+# Simple in-memory conversation memory
+# -------------------------
+class ConversationMemory:
+    def __init__(self, limit: int = 20):
+        self.limit = limit
+        self._messages: List[Dict[str, str]] = []
+
+    def add(self, role: str, content: str) -> None:
+        self._messages.append({"role": role, "content": content})
+        if len(self._messages) > self.limit:
+            # keep only the last `limit` messages
+            self._messages = self._messages[-self.limit :]
+
+    def get(self) -> List[Dict[str, str]]:
+        return self._messages.copy()
+
+memory = ConversationMemory(limit=20)
+
+# -------------------------
+# OpenAI helpers (safe guards)
+# -------------------------
+async def generate_openai_reply(messages: List[Dict[str, str]], temperature: float = 0.3, max_tokens: int = 600) -> str:
+    """Non-streaming single reply from OpenAI (fallback message if not configured)."""
+    if not (openai and OPENAI_API_KEY):
+        return "⚠️ OpenAI API key not configured. Set OPENAI_API_KEY to enable LLM responses."
+    try:
+        resp = openai.ChatCompletion.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return resp["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        # Avoid leaking sensitive details; return a helpful error string
+        return f"❌ OpenAI error: {str(e)}"
+
+def _openai_stream_generator(messages: List[Dict[str, str]], temperature: float = 0.3, max_tokens: int = 600):
+    """
+    Synchronous iterator wrapper around the OpenAI streaming API.
+    The OpenAI Python SDK yields events; we iterate and yield content deltas.
+    """
+    if not (openai and OPENAI_API_KEY):
+        # yield once and return — consumer expects an async generator but will receive this as sequence
+        yield "⚠️ OpenAI API key not configured."
+        return
+    try:
+        stream = openai.ChatCompletion.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        for chunk in stream:
+            # chunk should be a mapping
+            try:
+                if "choices" in chunk and chunk["choices"]:
+                    delta = chunk["choices"][0].get("delta", {})
+                    if not delta:
+                        continue
+                    content = delta.get("content")
+                    if content:
+                        yield content
+            except Exception:
+                # ignore malformed chunk and continue
+                continue
+        # indicate stream finished
+        yield "__STREAM_DONE__"
+    except Exception as e:
+        yield f"❌ Streaming error: {str(e)}"
+
+async def stream_openai_reply(messages: List[Dict[str, str]], temperature: float = 0.3, max_tokens: int = 600) -> AsyncGenerator[str, None]:
+    """
+    Async generator that yields streaming chunks from OpenAI.
+    Wraps the synchronous iterator to avoid blocking the event loop.
+    """
+    # Run the blocking OpenAI stream in a thread executor to avoid blocking the event loop
+    loop = None
+    try:
+        loop = __import__("asyncio").get_running_loop()
+    except Exception:
+        loop = None
+
+    # Define wrapper to pull from the blocking generator
+    def _iter_chunks():
+        for part in _openai_stream_generator(messages, temperature=temperature, max_tokens=max_tokens):
+            yield part
+
+    if loop:
+        # run blocking iterator in executor, yielding chunks asynchronously
+        for chunk in await loop.run_in_executor(None, lambda: list(_iter_chunks())):
+            yield chunk
+    else:
+        # fallback: synchronous context
+        for chunk in _iter_chunks():
+            yield chunk
+
+# -------------------------
+# Routes
+# -------------------------
+@app.get("/", response_class=HTMLResponse)
+async def home() -> HTMLResponse:
+    """Serve the built-in web UI (dark mode, markdown, typing animation)."""
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Advanced AI Chatbot</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #0f1720;
+    --muted: #9aa4b2;
+    --accent: #58a6ff;
+    --success: #7ee787;
+  }
+  body {
+    margin: 0;
+    padding: 2rem;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue';
+    background: var(--bg);
+    color: #e6edf3;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  h1 { margin: 0 0 1rem 0; }
+  #chat {
+    width: 100%;
+    max-width: 900px;
+    height: 560px;
+    background: linear-gradient(180deg, #111421, #0f1720);
+    border-radius: 12px;
+    padding: 16px;
+    overflow-y: auto;
+    box-shadow: 0 6px 20px rgba(2,6,23,0.6);
+    border: 1px solid rgba(255,255,255,0.03);
+  }
+  .msg { margin: 0.6rem 0; line-height: 1.45; }
+  .role { font-weight: 600; margin-right: 0.5rem; }
+  .user .role { color: var(--accent); }
+  .assistant .role { color: var(--success); }
+  #controls { margin-top: 12px; width: 100%; max-width: 900px; display:flex; gap:8px; }
+  #input { flex:1; padding: 10px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.04); background: #071018; color: #e6edf3; }
+  button { padding: 10px 14px; border-radius: 8px; border: none; background: #238636; color: white; cursor:pointer; }
+  button:hover { background:#2ea043; }
+  footer { margin-top: 1rem; color: var(--muted); font-size: 0.9rem; }
+  pre { background: #0b1220; padding: 10px; border-radius: 6px; overflow: auto; }
+</style>
+</head>
+<body>
+  <h1>🤖 Advanced AI Chatbot</h1>
+  <div id="chat" aria-live="polite"></div>
+  <div id="controls">
+    <input id="input" placeholder="Ask me anything..." autocomplete="off" />
+    <button id="send">Send</button>
+  </div>
+  <footer>Streaming via WebSocket | Markdown supported</footer>
+
+<script>
+const chat = document.getElementById("chat");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+
+function sanitizeHtml(html) {
+  // Minimal sanitization: rely on marked's output and browser. For production, consider DOMPurify.
+  return html;
+}
+
+function renderMarkdown(text) {
+  try {
+    return sanitizeHtml(marked.parse(text));
+  } catch (e) {
+    return text;
+  }
+}
+
+function appendMessage(role, rawText) {
+  const container = document.createElement("div");
+  container.className = "msg " + role;
+  const roleSpan = document.createElement("span");
+  roleSpan.className = "role";
+  roleSpan.textContent = role + ":";
+  const content = document.createElement("div");
+  content.className = "content";
+  content.innerHTML = renderMarkdown(rawText);
+  container.appendChild(roleSpan);
+  container.appendChild(content);
+  chat.appendChild(container);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+async function typingEffect(role, text) {
+  const container = document.createElement("div");
+  container.className = "msg " + role;
+  const roleSpan = document.createElement("span");
+  roleSpan.className = "role";
+  roleSpan.textContent = role + ":";
+  const content = document.createElement("span");
+  content.className = "content";
+  container.appendChild(roleSpan);
+  container.appendChild(content);
+  chat.appendChild(container);
+  chat.scrollTop = chat.scrollHeight;
+  // simple typing animation: append characters gradually
+  for (let i = 0; i < text.length; i++) {
+    content.textContent += text[i];
+    if (i % 8 === 0) chat.scrollTop = chat.scrollHeight;
+    await new Promise(r => setTimeout(r, 8)); // adjust speed
+  }
+  // After typing, parse markdown and replace
+  content.outerHTML = renderMarkdown(content.textContent);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text) return;
+  appendMessage("user", text);
+  input.value = "";
+  // Open WebSocket to stream response
+  const wsProto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${wsProto}://${location.host}/stream/ws`);
+  let buffer = "";
+  ws.onopen = () => ws.send(JSON.stringify({ text }));
+  ws.onmessage = (evt) => {
+    const data = evt.data;
+    if (data === "__STREAM_DONE__") {
+      // close and render typed response
+      ws.close();
+      typingEffect("assistant", buffer);
+    } else {
+      buffer += data;
+    }
+  };
+  ws.onerror = (ev) => {
+    appendMessage("assistant", "❌ Streaming error (WebSocket). Try the non-streaming endpoint /chat.");
+  };
+}
+
+sendBtn.addEventListener("click", sendMessage);
+input.addEventListener("keypress", (e) => { if (e.key === "Enter") sendMessage(); });
+
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html)
+
+@app.post("/chat")
+async def chat(req: ChatRequest) -> Dict[str, str]:
+    """
+    Non-streaming JSON chat endpoint.
+    Expects `req.messages` (list of {role, content}); returns a single 'reply'.
+    """
+    # Add last user message to memory if present
+    if req.messages:
+        memory.add("user", req.messages[-1].content)
+    # Build messages for the model: include a light system instruction + stored memory
+    messages = [{"role": "system", "content": "You are a helpful assistant."}] + memory.get() + [{"role": m.role, "content": m.content} for m in req.messages]
+    reply = await generate_openai_reply(messages, temperature=req.temperature or 0.3, max_tokens=req.max_tokens or 600)
+    memory.add("assistant", reply)
+    return {"reply": reply}
+
+@app.websocket("/stream/ws")
+async def stream_ws(ws: WebSocket):
+    """
+    WebSocket streaming endpoint.
+    Client should send a single JSON message: {"text": "<user message>"}.
+    Server streams tokens as plain text messages and ends with "__STREAM_DONE__".
+    """
+    await ws.accept()
+    try:
+        data = await ws.receive_text()
+        parsed = json.loads(data)
+        user_text = parsed.get("text", "")
+        memory.add("user", user_text)
+        # Build model messages: system instruction + conversation memory + new user message
+        messages = [{"role": "system", "content": "You are a helpful assistant."}] + memory.get() + [{"role": "user", "content": user_text}]
+        # Stream tokens asynchronously
+        async for chunk in stream_openai_reply(messages):
+            # each chunk is a string; send to client
+            await ws.send_text(chunk)
+        # After stream ends, append a placeholder (full text was built client-side)
+        memory.add("assistant", "(streamed response)")
+    except WebSocketDisconnect:
+        # client disconnected; nothing more to do
+        return
+    except Exception as e:
+        # Attempt to notify client, then close
+        try:
+            await ws.send_text(f"❌ Server error: {str(e)}")
+        except Exception:
+            pass
+        await ws.close()
+
+@app.post("/upload-docs")
+async def upload_docs(files: List[UploadFile] = File(...)):
+    """
+    Upload plain-text documents to add to the RAG knowledge base.
+    This endpoint requires sentence-transformers + faiss (optional).
+    Currently it collects the files and returns the count; extend for actual vector ingestion.
+    """
+    if not (SentenceTransformer and faiss):
+        raise HTTPException(status_code=500, detail="RAG dependencies not installed (sentence-transformers + faiss).")
+    docs = []
+    for f in files:
+        raw = await f.read()
+        try:
+            text = raw.decode("utf-8")
+        except Exception:
+            text = raw.decode("latin-1", errors="ignore")
+        docs.append({"id": f.filename, "text": text})
+    # TODO: ingest docs into vector store (FAISS/Pinecone/Weaviate)
+    return {"status": "ok", "added": len(docs)}
+
+# If run directly with `python main.py`, start uvicorn (helpful for local dev)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
+
