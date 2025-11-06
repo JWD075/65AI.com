@@ -1,0 +1,198 @@
+"""
+Advanced AI Chatbot - Production Ready
+======================================
+A self-contained FastAPI app with built-in chat UI and OpenAI backend.
+
+Endpoints:
+  GET  /            -> Chat Web UI
+  POST /chat        -> Non-streaming chat API
+  WS   /stream/ws   -> Streaming chat API
+  POST /upload-docs -> Upload docs for RAG (optional)
+"""
+
+import os, json, asyncio
+from typing import List, Dict, Optional
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+# Try optional imports for RAG
+try:
+    from sentence_transformers import SentenceTransformer
+    import faiss
+except ImportError:
+    SentenceTransformer = None
+    faiss = None
+
+# Try OpenAI import
+try:
+    import openai
+except ImportError:
+    openai = None
+
+# ----- Environment -----
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+if openai and OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+
+app = FastAPI(title="Advanced AI Chatbot")
+
+# ----- Models -----
+class Message(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[Message]
+    stream: Optional[bool] = False
+    max_tokens: Optional[int] = 1024
+    temperature: Optional[float] = 0.3
+
+
+# ----- Memory -----
+class ConversationMemory:
+    """In-memory chat history buffer."""
+    def __init__(self):
+        self.messages: List[Dict[str, str]] = []
+    def add(self, role, content):
+        self.messages.append({"role": role, "content": content})
+        if len(self.messages) > 20:
+            self.messages = self.messages[-20:]
+
+memory = ConversationMemory()
+
+
+# ----- AI Logic -----
+async def generate_openai_reply(messages: List[Dict[str, str]]) -> str:
+    """Return one full message."""
+    if not (openai and OPENAI_API_KEY):
+        return "⚠️ No OpenAI API key configured."
+    try:
+        resp = openai.ChatCompletion.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=600,
+        )
+        return resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"❌ OpenAI error: {e}"
+
+async def stream_openai_reply(messages: List[Dict[str, str]]):
+    """Stream tokens live from OpenAI."""
+    if not (openai and OPENAI_API_KEY):
+        yield "⚠️ No OpenAI API key configured."
+        return
+    try:
+        stream = openai.ChatCompletion.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=600,
+            stream=True,
+        )
+        for chunk in stream:
+            if "choices" in chunk and chunk["choices"]:
+                delta = chunk["choices"][0]["delta"].get("content")
+                if delta:
+                    yield delta
+        yield "__STREAM_DONE__"
+    except Exception as e:
+        yield f"❌ Streaming error: {e}"
+
+
+# ----- Routes -----
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    """Serve the built-in dark-themed chat UI."""
+    return HTMLResponse(content="""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>AI Chatbot</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;padding:2rem;}
+#chat{background:#161b22;border-radius:12px;box-shadow:0 0 10px #0003;padding:1rem;max-width:700px;width:100%;height:500px;overflow-y:auto;}
+.msg{margin:0.5rem 0;}
+.user{color:#58a6ff;}
+.assistant{color:#7ee787;}
+#row{display:flex;gap:0.5rem;margin-top:1rem;width:100%;max-width:700px;}
+#msg{flex:1;padding:0.6rem;border-radius:8px;border:1px solid #30363d;background:#0d1117;color:#e6edf3;}
+button{background:#238636;color:white;border:none;border-radius:8px;padding:0.6rem 1.2rem;cursor:pointer;}
+button:hover{background:#2ea043;}
+</style>
+</head>
+<body>
+<h1>🤖 AI Chatbot</h1>
+<div id="chat"></div>
+<div id="row">
+  <input id="msg" placeholder="Type message..."/>
+  <button id="send">Send</button>
+</div>
+<script>
+const chat=document.getElementById("chat"),input=document.getElementById("msg"),btn=document.getElementById("send");
+function md(t){return marked.parse(t);}
+function add(role,txt){const d=document.createElement("div");d.className="msg "+role;d.innerHTML="<strong>"+role+":</strong> "+md(txt);chat.appendChild(d);chat.scrollTop=chat.scrollHeight;}
+async function send(){
+  const t=input.value.trim();if(!t)return;add("user",t);input.value="";
+  const ws=new WebSocket(`ws://${location.host}/stream/ws`);
+  let buffer="";
+  ws.onopen=()=>ws.send(JSON.stringify({text:t}));
+  ws.onmessage=ev=>{
+    if(ev.data==="__STREAM_DONE__"){ws.close();add("assistant",buffer);}
+    else buffer+=ev.data;
+  };
+}
+btn.onclick=send;
+input.addEventListener("keypress",e=>{if(e.key==="Enter")send();});
+</script>
+</body>
+</html>
+""")
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    """Return non-stream reply."""
+    memory.add("user", req.messages[-1].content)
+    reply = await generate_openai_reply(req.messages)
+    memory.add("assistant", reply)
+    return {"reply": reply}
+
+
+@app.websocket("/stream/ws")
+async def stream_ws(ws: WebSocket):
+    """WebSocket for streaming."""
+    await ws.accept()
+    try:
+        data = await ws.receive_text()
+        msg = json.loads(data)
+        user_text = msg.get("text", "")
+        memory.add("user", user_text)
+        messages = [{"role": "system", "content": "You are a helpful assistant."}] + memory.messages
+        async for chunk in stream_openai_reply(messages):
+            await ws.send_text(chunk)
+        memory.add("assistant", "(streamed)")
+    except WebSocketDisconnect:
+        print("Client disconnected")
+    except Exception as e:
+        await ws.send_text(f"❌ Error: {e}")
+        await ws.close()
+
+
+@app.post("/upload-docs")
+async def upload_docs(files: List[UploadFile] = File(...)):
+    """Upload plain text docs for future RAG use."""
+    if not (SentenceTransformer and faiss):
+        raise HTTPException(status_code=500, detail="RAG dependencies missing.")
+    docs = []
+    for f in files:
+        content = (await f.read()).decode("utf-8")
+        docs.append({"id": f.filename, "text": content})
+    return {"status": "ok", "added": len(docs)}
